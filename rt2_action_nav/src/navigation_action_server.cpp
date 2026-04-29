@@ -9,6 +9,7 @@
 #include "tf2/LinearMath/Matrix3x3.h"
 #include "tf2_ros/transform_listener.hpp"
 #include "tf2_ros/buffer.hpp"
+#include "tf2_ros/transform_broadcaster.hpp"
 #include "rclcpp_action/rclcpp_action.hpp"
 #include "action_interfaces/action/mapstogoal.hpp"
 #include <cmath>
@@ -43,6 +44,8 @@ namespace nav_action
 
                 tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_);
 
+                goal_tf_broadcaster_ = std::make_shared<tf2_ros::TransformBroadcaster>(this);
+
                 timer_ = this->create_wall_timer(
                     std::chrono::milliseconds(100),
                     std::bind(&RobotNavigatorActionServer::timer_callback, this));  
@@ -55,6 +58,7 @@ namespace nav_action
             rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr goal_frame_subsciber_{nullptr};
             std::shared_ptr<tf2_ros::TransformListener> tf_listener_{nullptr};
             std::unique_ptr<tf2_ros::Buffer> tf_buffer_;
+            std::shared_ptr<tf2_ros::TransformBroadcaster> goal_tf_broadcaster_{nullptr};
             rclcpp::TimerBase::SharedPtr timer_{nullptr};
             geometry_msgs::msg::Pose current_pose_;
             geometry_msgs::msg::PoseStamped goal_pose_;
@@ -67,9 +71,9 @@ namespace nav_action
             float goal_theta_ = 0.0;
 
             const float GOAL_TOLERANCE  = 0.2f;   // metres
-            const float THETA_TOLERANCE = 0.05f;  // radians (~3 degrees)
-            const float LINEAR_VELOCITY  = 0.5f;   // m/s  (capped by diff-drive plugin)
-            const float ANGULAR_VELOCITY = 1.5f;   // rad/s gain
+            const float THETA_TOLERANCE = 0.05f;  // radians
+            const float LINEAR_VELOCITY  = 0.5f;   // m/s  
+            const float ANGULAR_VELOCITY = 1.5f;   // rad/s 
             
             std::mutex goal_mutex_;
 
@@ -97,6 +101,7 @@ namespace nav_action
                     goal_reached_ = false;
                 }
                 current_goal_handle_ = goal_handle;
+
                 std::thread(&RobotNavigatorActionServer::execute, this, goal_handle).detach();
             }
 
@@ -170,6 +175,18 @@ namespace nav_action
             void odom_callback(const nav_msgs::msg::Odometry::SharedPtr msg)
             {
                 current_pose_ = msg->pose.pose;
+
+                // Broadcast odom -> base_footprint  
+                geometry_msgs::msg::TransformStamped odom_tf;
+                odom_tf.header.stamp = msg->header.stamp;
+                odom_tf.header.frame_id = "odom";
+                odom_tf.child_frame_id = "base_footprint";
+                odom_tf.transform.translation.x = msg->pose.pose.position.x;
+                odom_tf.transform.translation.y = msg->pose.pose.position.y;
+                odom_tf.transform.translation.z = msg->pose.pose.position.z;
+                odom_tf.transform.rotation = msg->pose.pose.orientation;
+                goal_tf_broadcaster_->sendTransform(odom_tf);
+
             }
             void goal_pose_callback(const geometry_msgs::msg::PoseStamped::SharedPtr msg)
             {
@@ -177,14 +194,30 @@ namespace nav_action
             }
             void timer_callback()
             {
-                geometry_msgs::msg::Twist cmd_vel;  // zero-initialised by default
+                geometry_msgs::msg::Twist cmd_vel;  
 
                 {
                     std::lock_guard<std::mutex> lock(goal_mutex_);
 
                     if (has_active_goal_)
                     {
-                        // --- Use odometry pose (map frame) directly ---
+                        // Broadcast the goal as a TF frame continuously
+                        geometry_msgs::msg::TransformStamped goal_tf;
+                        goal_tf.header.stamp = this->get_clock()->now();
+                        goal_tf.header.frame_id = "odom";
+                        goal_tf.child_frame_id  = "goal_frame";
+                        goal_tf.transform.translation.x = goal_x_;
+                        goal_tf.transform.translation.y = goal_y_;
+                        goal_tf.transform.translation.z = 0.0;
+                        tf2::Quaternion goal_q;
+                        goal_q.setRPY(0.0, 0.0, goal_theta_);
+                        goal_tf.transform.rotation.x = goal_q.x();
+                        goal_tf.transform.rotation.y = goal_q.y();
+                        goal_tf.transform.rotation.z = goal_q.z();
+                        goal_tf.transform.rotation.w = goal_q.w();
+                        goal_tf_broadcaster_->sendTransform(goal_tf);
+
+                        // Use odometry pose (map frame)
                         float dx = goal_x_ - current_pose_.position.x;
                         float dy = goal_y_ - current_pose_.position.y;
                         float distance = std::sqrt(dx * dx + dy * dy);
@@ -209,7 +242,7 @@ namespace nav_action
                             while (heading_error >  M_PI) heading_error -= 2.0f * M_PI;
                             while (heading_error < -M_PI) heading_error += 2.0f * M_PI;
 
-                            // Differential drive: linear.x only (linear.y is ignored by diff-drive)
+                            // Differential drive: linear.x  only
                             // Reduce forward speed when not yet facing the goal
                             float alignment = std::cos(heading_error);  // 1 when aligned, 0 when 90 deg off
                             cmd_vel.linear.x  = LINEAR_VELOCITY * std::max(0.0f, alignment);

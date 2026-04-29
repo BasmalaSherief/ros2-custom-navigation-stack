@@ -42,7 +42,7 @@ namespace nav_action
                     if (input == "exit")
                     {
                         running = false;
-                        continue;
+                        break;
                     }
                     else if (input == "cancel")
                     {
